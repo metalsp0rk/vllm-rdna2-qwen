@@ -167,6 +167,7 @@ from vllm.v1.outputs import (
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
+from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
@@ -955,6 +956,9 @@ class GPUModelRunner(
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
         self.layerwise_nvtx_hooks_registered = False
+
+        # PLE Offload
+        self._ple_offload_connector: PleOffloadConnector | None = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -4204,6 +4208,15 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            # Queue PLE staging before the GPU reaches the PLE layer so CPU
+            # lookup and the preceding GPU layers can overlap.
+            if self._ple_offload_connector is not None:
+                with record_function_or_nullcontext("launch_ple_offload"):
+                    self._ple_offload_connector.prepare_forward(
+                        num_reqs,
+                        num_tokens_padded,
+                        dummy_run=False,
+                    )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4211,6 +4224,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            self._release_ple_offload_outputs()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5774,6 +5788,13 @@ class GPUModelRunner(
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
+            if self._ple_offload_connector is not None:
+                self._ple_offload_connector.prepare_forward(
+                    num_reqs,
+                    num_tokens_padded,
+                    dummy_run=True,
+                )
+            model_kwargs = self._init_model_kwargs()
             model_kwargs = self._init_model_kwargs(num_reqs=0)
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
@@ -5847,6 +5868,7 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                self._release_ple_offload_outputs()
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -6240,6 +6262,10 @@ class GPUModelRunner(
         memory is reclaimable when running in the same process."""
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
+
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.close()
+            self._ple_offload_connector = None
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
