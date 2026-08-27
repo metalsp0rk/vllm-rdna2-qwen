@@ -1385,11 +1385,13 @@ set(VLLM_MOE_EXT_SRC
   "csrc/moe/moe_align_sum_kernels.cu"
   "csrc/moe/topk_softmax_kernels.cu"
   "csrc/moe/topk_softplus_sqrt.cu"
-  ${VLLM_TOPK_SOFTPLUS_SQRT_SRC})
+  ${VLLM_TOPK_SOFTPLUS_SQRT_SRC}
+  # moe_wna16 builds for HIP too: its PTX helpers have portable ROCm
+  # equivalents in moe_wna16_utils.h (gfx1030 W4 MoE decode path)
+  "csrc/moe/moe_wna16.cu")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_MOE_EXT_SRC
-    "csrc/moe/moe_wna16.cu"
     "csrc/moe/grouped_topk_kernels.cu"
     "csrc/moe/fused_globalize_align_block_size.cu")
 endif()
