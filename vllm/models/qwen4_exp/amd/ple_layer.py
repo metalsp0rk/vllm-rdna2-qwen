@@ -295,6 +295,33 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             self.ngram_embedding.weight.device,
             self.ngram_embedding.weight.is_pinned(),
         )
+        # ngram_heads_vocab_sizes/offsets are config-derived (the primes
+        # above), not learned. Keep Python copies so the offload worker, which
+        # materializes its meta-constructed model without checkpoint data, can
+        # restore them verbatim (a zeroed vocab-size table divides by zero in
+        # the n-gram hash).
+        self._ngram_sizes = list(sizes)
+        self._ngram_offsets = list(offsets)
+
+    def _materialize_workspace(self, device: torch.device) -> None:
+        """Restore the config-derived hash tables in the offload worker.
+
+        The PLE offload worker builds the model on the meta device and
+        materializes only what the checkpoint provides; under
+        load_format=dummy, to_empty() leaves these persistent buffers zeroed.
+        Both tables are config-derived, so restore them exactly.
+        """
+        if (
+            not self.ngram_heads_vocab_sizes.is_meta
+            and int(self.ngram_heads_vocab_sizes.sum()) != 0
+        ):
+            return
+        self.ngram_heads_vocab_sizes = torch.tensor(
+            self._ngram_sizes, dtype=torch.long, device=device
+        )
+        self.ngram_heads_offsets = torch.tensor(
+            self._ngram_offsets, dtype=torch.long, device=device
+        )
 
     def _sp_shard_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
         """Shard embedding token rows, optionally reducing vocabulary contributions."""
@@ -317,19 +344,51 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return full embeddings or a token shard after combining vocabulary owners."""
+        del hidden_states  # the AMD path never consumes it
         input_ids = input_ids.reshape(-1)
         ngram_ids = input_ids.new_empty(
             (input_ids.shape[0], self.ngram_heads), dtype=torch.int64
         )
-        torch.ops.vllm.qwen4_exp_amd_ple_ngram_ids(
-            input_ids,
-            query_start_loc,
-            ngram_context,
-            ngram_ids,
-            self.layer_name,
-        )
+        if is_offload_process():
+            # The custom op resolves its layer through the forward context and
+            # binds to the CUDA dispatch key; the offload worker has neither.
+            # Compute the hashed n-gram ids with the same pure function inline.
+            self._materialize_workspace(input_ids.device)
+            ple_ngram_ids(
+                input_ids=input_ids,
+                query_start_loc=query_start_loc,
+                ngram_context=ngram_context,
+                layer_multipliers=self.layer_multipliers,
+                ngram_heads_vocab_sizes=self.ngram_heads_vocab_sizes,
+                ngram_heads_offsets=self.ngram_heads_offsets,
+                eos_token_id=self.eos_token_id,
+                heads_per_ngram=self.heads_per_ngram,
+                output=ngram_ids,
+            )
+        else:
+            torch.ops.vllm.qwen4_exp_amd_ple_ngram_ids(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                ngram_ids,
+                self.layer_name,
+            )
         embedding = self.ngram_embedding
-        if embedding.supports_prefetch:
+        if is_offload_process():
+            # Two reasons the custom op cannot be used in the offload worker:
+            # direct_register_custom_op binds it to the platform dispatch key
+            # ("CUDA" on ROCm) while the worker runs on CPU, and the op resolves
+            # its layer through the forward context, which the worker never
+            # sets. Both are indirections the op only needs on the GPU side --
+            # it exists to keep the embedding opaque to graph capture, which
+            # the offload process does not do -- and we are already inside the
+            # owning module, so do the lookup directly.
+            output = ngram_ids.new_empty(
+                (ngram_ids.shape[0], self.embedding_dim),
+                dtype=embedding.params_dtype,
+            )
+            output.copy_(self.ngram_embedding(ngram_ids).flatten(-2))
+        elif embedding.supports_prefetch:
             output = ngram_ids.new_empty(
                 (ngram_ids.shape[0], self.embedding_dim),
                 dtype=embedding.weight.dtype,
