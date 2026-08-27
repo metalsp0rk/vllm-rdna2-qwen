@@ -93,6 +93,7 @@ from vllm.v1.watermarking.spec_decode import (
     create_speculative_target_watermarker,
     speculative_target_watermark_key,
 )
+from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.extensible_kv_cache import (
     ExtensibleKVCache,
@@ -370,6 +371,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self._ple_offload_connector: PleOffloadConnector | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -394,6 +396,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # on the last PP rank.
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
+
+    def _setup_ple_offload(self, ipc_addr: str) -> None:
+        """Initialize PLE offload after the model state is available."""
+        # PLE placeholders are created by model loading, so CUDA output
+        # registration cannot happen in the runner constructor.
+        query_start_loc_source = getattr(self.model_state, "ple_query_start_loc", None)
+        ngram_context_source = getattr(self.model_state, "ngram_context", None)
+        if not isinstance(query_start_loc_source, torch.Tensor):
+            raise RuntimeError("PLE offload requires a query_start_loc source")
+        if not isinstance(ngram_context_source, torch.Tensor):
+            raise RuntimeError("PLE offload requires an ngram_context source")
+        self._ple_offload_connector = PleOffloadConnector(
+            self.vllm_config,
+            self.model,
+            self.device,
+            ipc_addr,
+            input_ids_source=self.input_buffers.input_ids,
+            query_start_loc_source=query_start_loc_source,
+            ngram_context_source=ngram_context_source,
+        )
 
     def load_model(
         self,
@@ -1160,6 +1182,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
+            # Decoder capture calls the model outside execute_model. Keep dummy PLE
+            # outputs signaled until every graph has captured its semaphore wait.
+            if self._ple_offload_connector is not None and capture_decoder:
+                self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
             with self.maybe_setup_dummy_loras(self.lora_config):
                 if capture_encoder:
                     self.model_state.encoder_runner.capture()
@@ -1208,6 +1234,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Lock workspace to prevent resizing during execution. A resize after
             # capture frees the static cuda graph buffer.
             lock_workspace()
+
+            # The graphs are captured; unblock the CPU worker so it can refill
+            # the registered output buffers.
+            if self._ple_offload_connector is not None and capture_decoder:
+                self._ple_offload_connector.release_outputs()
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
@@ -2115,6 +2146,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        # prepare_inputs has finalized MRV2's GPU buffers. Record readiness so
+        # the request thread can stage them before the PLE placeholder runs.
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.prepare_forward(
+                input_batch.num_reqs,
+                input_batch.num_tokens_after_padding,
+                dummy_run,
+            )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2164,6 +2204,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        # The model has consumed every PLE output, so the CPU worker may reuse
+        # the registered buffers for the next request.
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.release_outputs()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -2476,6 +2520,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.aux_output_connector is not None:
             self.aux_output_connector.close()
         set_offloader(None)
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.close()
+            self._ple_offload_connector = None
         self.cudagraph_manager = None
         self.fast_prefill = None
         self.pooling_runner = None

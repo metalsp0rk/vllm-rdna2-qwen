@@ -19,6 +19,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
+from vllm.model_executor.layers.ple_offload_layer import (
+    PleOffloadLayer,
+    is_offload_process,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -81,7 +85,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
 
 
-class Qwen4ExpNGramEmbedding(nn.Module):
+class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
     _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
@@ -304,11 +308,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             embeddings = sp_shard(embeddings)
         return embeddings.view(output_dtype)
 
-    def forward(
+    def forward_impl(  # type: ignore[override]
         self,
+        hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return full embeddings or a token shard after combining vocabulary owners."""
         input_ids = input_ids.reshape(-1)
@@ -739,7 +745,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self.ple_embedding(
+            hidden_states, input_ids, query_start_loc, ngram_context
+        )
         embeddings = self.ple_embedding.ngram_embedding.dequantize(
             embeddings, hidden_states.dtype
         )

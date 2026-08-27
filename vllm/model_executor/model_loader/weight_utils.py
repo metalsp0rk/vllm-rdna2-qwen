@@ -68,6 +68,7 @@ except ImportError:
     fastsafetensors = PlaceholderModule("fastsafetensors")
     SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 
 if TYPE_CHECKING:
@@ -1140,6 +1141,8 @@ def safetensors_weights_iterator(
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
+    if is_offload_process():
+        loading_desc += "(PLE-offload)"
 
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
 
