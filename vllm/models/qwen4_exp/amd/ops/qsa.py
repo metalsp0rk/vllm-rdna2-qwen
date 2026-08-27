@@ -852,10 +852,12 @@ def qsa_sparse_paged_attention(
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     is_fp8 = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    assert q.dtype == torch.bfloat16
+    # gfx1030 lacks native BF16; FP16 measured faster and ~7x more accurate
+    # against an FP32 reference on this kernel, so both are permitted.
+    assert q.dtype in (torch.bfloat16, torch.float16)
     assert k_cache.dtype == v_cache.dtype
-    assert is_fp8 or k_cache.dtype == torch.bfloat16, (
-        "QSA sparse attention requires BF16 or FP8-e4m3 K/V"
+    assert is_fp8 or k_cache.dtype == q.dtype, (
+        "QSA sparse attention requires BF16/FP16 (matching Q) or FP8-e4m3 K/V"
     )
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
