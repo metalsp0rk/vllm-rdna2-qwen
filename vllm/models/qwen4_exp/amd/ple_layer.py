@@ -388,7 +388,17 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 (ngram_ids.shape[0], self.embedding_dim),
                 dtype=embedding.params_dtype,
             )
-            output.copy_(self.ngram_embedding(ngram_ids).flatten(-2))
+            quant = getattr(self.ngram_embedding, "_ple_quant", None)
+            if quant is not None:
+                # Quantized sidecar: the checkpoint table was stubbed to an empty
+                # tensor, and gathers are dequantized straight out of the mmapped
+                # shards. ngram_ids is (tokens, heads) and output is
+                # (tokens, heads * head_dim), so both flatten to per-head rows.
+                quant.gather_into(
+                    ngram_ids.reshape(-1), output.reshape(-1, self.head_dim)
+                )
+            else:
+                output.copy_(self.ngram_embedding(ngram_ids).flatten(-2))
         elif embedding.supports_prefetch:
             output = ngram_ids.new_empty(
                 (ngram_ids.shape[0], self.embedding_dim),
