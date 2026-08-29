@@ -1734,6 +1734,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/torch_bindings.cpp"
     ${VLLM_SKINNY_SRC}
     "csrc/rocm/rdna_allreduce.cu"
+    "csrc/rocm/rdna_fused_glue.cu"
     "csrc/rocm/attention_dispatch.cu"
     ${VLLM_ATTENTION_PAGED_ATTN_SRC})
 
