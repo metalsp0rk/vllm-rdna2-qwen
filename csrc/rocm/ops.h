@@ -63,6 +63,9 @@ void rdna35_gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
                         torch::Tensor& cu_seqlens, torch::Tensor& out,
                         torch::Tensor& final_state, double scale);
 
+at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
+                          const std::optional<at::Tensor>& bias);
+
 void moe_skinny_int4_decode(const at::Tensor& input, const at::Tensor& w13,
                             const at::Tensor& w13_scale, const at::Tensor& w2,
                             const at::Tensor& w2_scale,
