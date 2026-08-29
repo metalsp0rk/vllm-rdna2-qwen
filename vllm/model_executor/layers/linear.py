@@ -225,6 +225,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 and weight.stride(0) != 1
             ):
                 layer.weight.data = weight.t().contiguous().t()
+        # T45: gfx1030 int8 shadow for decode-shaped GEMVs (VLLM_RDNA_DENSE_INT8=1)
+        elif current_platform.is_rocm():
+            from vllm.model_executor.layers import rdna_dense_int8
+
+            rdna_dense_int8.make_shadow(layer)
 
     def apply(
         self,
@@ -236,6 +241,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ):
             return linear_batch_invariant(x, layer.weight, bias)
+        if hasattr(layer, "weight_i8"):
+            from vllm.model_executor.layers import rdna_dense_int8
+
+            out = rdna_dense_int8.apply(layer, x, bias)
+            if out is not None:
+                return out
         return self._gemm_impl(layer, x, layer.weight, bias)
 
 
