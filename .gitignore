@@ -257,3 +257,8 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 /.rocm-version/
 /.rocm-wheel/
 /.rocm-kernel-map/
+
+# this fork (rdna2): out-of-tree extension builds, traces, local model dirs
+build_rocm/
+logs/
+models/
