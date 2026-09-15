@@ -34,6 +34,7 @@ from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
 )
+from vllm.distributed.device_communicators.rdna_all_reduce import rdna_ar_check
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.wrapper import compile_model_with_stock_torch
@@ -1865,6 +1866,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # T44b (gfx1030): a one-shot all-reduce that hit its spin cap in the previous step has
+        # already returned garbage; read its host-mapped record (no sync) and fail loudly now.
+        rdna_ar_check()
         if not dummy_run:
             self.draft_tokens_handler.begin_step(scheduler_output)
             # Update the request states.
