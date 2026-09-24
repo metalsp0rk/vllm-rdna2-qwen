@@ -600,6 +600,7 @@ class QSAIndexerMetadata(AttentionMetadata):
     # Key rows per physical cache block.
     storage_block_size: int
     compress_ratio: int
+    max_seq_len: int = 0  # host-side, for bounding the indexer's scored columns (2026-09-24)
 
 
 class QSAIndexerMetadataBuilder(AttentionMetadataBuilder[QSAIndexerMetadata]):
@@ -727,6 +728,7 @@ class QSAIndexerMetadataBuilder(AttentionMetadataBuilder[QSAIndexerMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            max_seq_len=int(common_attn_metadata.max_seq_len),
         )
 
 
