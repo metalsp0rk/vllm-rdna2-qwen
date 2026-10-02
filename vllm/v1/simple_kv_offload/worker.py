@@ -3,19 +3,28 @@
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
 import mmap
+import os
 from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.host_memory import (
+    HOST_REGISTER_CHUNK_BYTES,
     host_registration_ranges,
     pin_tensor,
     unpin_tensor,
 )
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+from vllm.v1.simple_kv_offload.cuda_mem_ops import (
+    CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+    BatchMemcpyParams,
+    build_params,
+    copy_blocks,
+)
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
 from vllm.v1.simple_kv_offload.host_buffer import alloc_host_buffer
 from vllm.v1.simple_kv_offload.metadata import (
@@ -28,6 +37,28 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+_THP = os.getenv("VLLM_RDNA_OFFLOAD_THP", "1") == "1"
+if _THP:
+    # Fork default: back the offload tier with transparent huge pages so
+    # compaction cannot migrate it (hwconfig rationale). Upstream's
+    # alloc_host_buffer honors THP unless configured otherwise.
+    os.environ.setdefault("THP_MEM_ALLOC_ENABLE", "1")
+
+
+def _registration_chunk_bytes() -> int:
+    # gfx1030 fork: on ROCm each registration is one KFD userptr BO whose pages
+    # the kernel may migrate (compaction); KFD then evicts every GPU queue of the
+    # process and re-faults + remaps the WHOLE BO before restoring them (12 GB ->
+    # 12-20 s with no GPU progress on that rank, measured 2026-10-01 via
+    # /sys/class/kfd/kfd/proc/<pid>/stats_*/evicted_ms). Registering in
+    # block-aligned chunks bounds each stall to one chunk; batch-copy
+    # descriptors never span a chunk (host_registration_ranges aligns bounds).
+    # VLLM_RDNA_OFFLOAD_PIN_CHUNK_MB=0 registers the whole tier in one piece.
+    chunk_mb = int(os.getenv("VLLM_RDNA_OFFLOAD_PIN_CHUNK_MB", "128"))
+    if current_platform.is_rocm() and chunk_mb > 0:
+        return chunk_mb << 20
+    return HOST_REGISTER_CHUNK_BYTES
 
 
 class SimpleCPUOffloadWorker:
@@ -256,6 +287,32 @@ class SimpleCPUOffloadWorker:
             self.load_stream,
             self.store_stream,
         )
+        self._rescue_caches = (unique_gpu_caches, self.cpu_kv_caches)
+        self._rescue_params: dict[int, BatchMemcpyParams] = {}
+        self._rescue_done: torch.Event | None = None
+
+    def rescue_copy(self, metadata: SimpleCPUOffloadMetadata) -> None:
+        """gfx1030 fork, lazy mode: copy blocks the scheduler evicted this step
+        before they were offloaded (manager._on_gpu_evict). Must run before
+        the model runner zeroes newly allocated blocks (_update_states), so it
+        is called at the top of Worker.execute_model, on the compute stream:
+        ordered after the previous step's forward, before this step's zeroing
+        and forward. Loads of this step wait for it (they may target the same
+        blocks)."""
+        if not metadata.rescue_gpu_blocks:
+            self._rescue_done = None
+            return
+        stream = torch.cuda.current_stream()
+        params = self._rescue_params.get(stream.cuda_stream)
+        if params is None:
+            gpu, cpu = self._rescue_caches
+            params = build_params(gpu, cpu, stream,
+                                  src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM)
+            self._rescue_params[stream.cuda_stream] = params
+        copy_blocks(metadata.rescue_gpu_blocks, metadata.rescue_cpu_blocks, params)
+        if self._rescue_done is None:
+            self._rescue_done = torch.Event()
+        self._rescue_done.record(stream)
 
     def _alloc_cpu_caches(
         self, unique_gpu_caches: dict[str, torch.Tensor], pin_memory: bool
@@ -280,6 +337,7 @@ class SimpleCPUOffloadWorker:
                     layer_bytes,
                     self.num_cpu_blocks,
                     buf.nbytes,
+                    max_chunk_bytes=_registration_chunk_bytes(),
                     page_size=self.cpu_hugepage_size or mmap.PAGESIZE,
                 ):
                     tensor = buf[start:end]
@@ -316,6 +374,7 @@ class SimpleCPUOffloadWorker:
                 is_store=False,
                 event_idx=metadata.load_event,
                 events_list=self._load_events,
+                wait_event=getattr(self, "_rescue_done", None),
             )
 
     def wait_for_save(self) -> None:
