@@ -261,7 +261,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         if (
             self.quant_config.use_int4_w4a16
             and hidden_states.dtype == torch.float16
-            and hidden_states.shape[0] <= 8
+            and hidden_states.shape[0] <= 16
             and activation == MoEActivation.SILU
             and not apply_router_weight_on_input
             and self.quant_config.w1_zp is None
@@ -732,7 +732,7 @@ class TritonWNA16Experts(TritonExperts):
         if (
             self.quant_config.use_int4_w4a16
             and hidden_states.dtype == torch.float16
-            and hidden_states.shape[0] <= 8
+            and hidden_states.shape[0] <= 16
             and activation == MoEActivation.SILU
             and not apply_router_weight_on_input
             and self.quant_config.w1_zp is None
