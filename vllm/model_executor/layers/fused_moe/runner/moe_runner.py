@@ -603,6 +603,43 @@ class MoERunner(MoERunnerInterface):
             assert shared_experts_input is not None
             self._shared_experts(shared_experts_input, order)
 
+    def _maybe_offer_shared_to_routed(
+        self,
+        hidden_states: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> bool:
+        if (
+            not current_platform.is_rocm()
+            or self._shared_experts is None
+            or shared_experts_input is None
+            or shared_experts_input.data_ptr() != hidden_states.data_ptr()
+            or shared_experts_input.shape != hidden_states.shape
+            or self.routed_experts.quant_method.is_monolithic
+            or self.routed_scaling_factor != 1.0
+            or self._shared_experts._determine_shared_experts_order(hidden_states)
+            != SharedExpertsOrder.NO_OVERLAP
+        ):
+            return False
+        from vllm.model_executor.layers import rdna_ops
+
+        return rdna_ops.moe_v3_offer(self._shared_experts._layer, hidden_states)
+
+    def _finish_shared_offer(self, shared_experts_input: torch.Tensor | None):
+        from vllm.model_executor.layers import rdna_ops
+
+        assert self._shared_experts is not None
+        shared = rdna_ops.moe_v3_taken()
+        if shared is None:
+            logger.warning_once(
+                "rdna MoE v3: shared expert offered but not fused; running it separately"
+            )
+            self._maybe_apply_shared_experts(
+                shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+            )
+        else:
+            logger.info_once("rdna MoE v3: shared expert fused into the routed kernel")
+            self._shared_experts._output[self._shared_experts._output_idx] = shared
+
     def _apply_quant_method(
         self,
         hidden_states: torch.Tensor,
@@ -625,9 +662,15 @@ class MoERunner(MoERunnerInterface):
         `hidden_states_scale` is set when `hidden_states` were quantized before
         the PCP all-gather.
         """
-        self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+        # gfx1030 fork: offer the shared expert to the routed int4 decode kernel
+        # (rdna_ops.try_moe_v3); if it is not taken, it runs below as usual.
+        v3_offered = self._maybe_offer_shared_to_routed(
+            hidden_states, shared_experts_input
         )
+        if not v3_offered:
+            self._maybe_apply_shared_experts(
+                shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+            )
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
@@ -659,6 +702,8 @@ class MoERunner(MoERunnerInterface):
         if shared_experts_overlapping:
             assert self._shared_experts is not None
             self._shared_experts.wait()
+        if v3_offered:
+            self._finish_shared_offer(shared_experts_input)
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
