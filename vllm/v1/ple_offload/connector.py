@@ -28,6 +28,7 @@ else:
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
+from vllm.utils import rdna_op_timing
 
 # Test hook (2026-09-05): PLE_OFFLOAD_DEBUG_HOPS=1 stamps perf_counter_ns() at each hop of the
 # per-step round-trip into spare int64 slots of the shared done page (both processes, same
@@ -498,6 +499,7 @@ class PleOffloadConnector:
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
+        rdna_op_timing.set_step(num_tokens)
         self._launch_seq += 1
         t0 = time.perf_counter()
         inline = _DOORBELL and self._uses_cuda_inputs
