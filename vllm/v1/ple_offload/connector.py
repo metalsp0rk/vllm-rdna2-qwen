@@ -38,6 +38,9 @@ _HOPS = os.getenv("PLE_OFFLOAD_DEBUG_HOPS", "0") == "1"
 # and the sidecar spins on that page. Removes the socket hop and the sidecar's poll wake-up
 # (~170 us/step) and keeps the sidecar's core hot. PLE_OFFLOAD_DOORBELL=0 restores ZMQ.
 _DOORBELL = os.getenv("PLE_OFFLOAD_DOORBELL", "1") == "1"
+# Measurement hook (2026-11-05): PLE_OFFLOAD_STEP_TIMING=DIR appends rank<r>.csv with the host time of each prepare_forward
+# phase. On rank 0, launch_ms includes waiting for the previous forward and the D2H copy, so its wait_ms is the lookup itself.
+_STEP_TIMING_DIR = os.getenv("PLE_OFFLOAD_STEP_TIMING", "")
 _DB_SEQ, _DB_NTOK, _DB_NREQ = 4, 5, 6  # int32 slots of the done page (slot 0 = done seq; int64 slots >= 8 = hop stamps)
 _HOP_D2H, _HOP_SENT, _HOP_RECV, _HOP_LOOKUP, _HOP_PUB, _HOP_SEEN, _HOP_ENQ = 8, 9, 10, 11, 12, 13, 14
 _HOP_NAMES = ("d2h->sent", "sent->recv", "recv->lookup", "lookup->publish", "publish->seen", "seen->enqueued", "TOTAL d2h->enqueued")
@@ -514,6 +517,7 @@ class PleOffloadConnector:
         # step N+1's lookup needs step N's sampled token, so the chain is serial
         # anyway, and async scheduling still overlaps this wait with forward N.
         self._wait_lookup_done(self._launch_seq, num_tokens, spin_now=inline and self.tp_rank == 0)
+        t_waited = time.perf_counter()
         t_seen_ns = time.perf_counter_ns() if _HOPS else 0
         # The result is in the shared pinned buffer: copy it to our device buffer on the
         # model stream (stream-ordered before the forward) and raise the flag the eager
@@ -526,6 +530,19 @@ class PleOffloadConnector:
             if PLE_GPU_FLAG:
                 layer._sem.signal(stream)
         t2 = time.perf_counter()
+        if _STEP_TIMING_DIR:
+            f = getattr(self, "_step_timing_file", None)
+            if f is None:
+                os.makedirs(_STEP_TIMING_DIR, exist_ok=True)
+                f = self._step_timing_file = open(
+                    os.path.join(_STEP_TIMING_DIR, f"rank{self.tp_rank}.csv"), "a", buffering=1
+                )
+                f.write("seq,host_t,num_tokens,since_prev_ms,launch_ms,wait_ms,copy_ms\n")
+            prev = getattr(self, "_step_timing_prev", None)
+            self._step_timing_prev = t2
+            f.write(f"{self._launch_seq},{time.time():.3f},{num_tokens},"
+                    f"{(t0 - prev) * 1e3 if prev else -1:.3f},{(t1 - t0) * 1e3:.3f},"
+                    f"{(t_waited - t1) * 1e3:.3f},{(t2 - t_waited) * 1e3:.3f}\n")
         self._t_launch += t1 - t0
         self._t_wait += t2 - t1
         if _HOPS and self.tp_rank == 0 and num_tokens <= 8:
