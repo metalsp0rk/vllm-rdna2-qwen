@@ -19,6 +19,8 @@ dim is a multiple of G take this path; graph-captured decode and small prefills 
 """
 
 import os
+import time
+from collections import deque
 
 import torch
 
@@ -28,6 +30,37 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 
 _G = int(os.getenv("VLLM_RDNA_AR_Q8_GROUP", "64"))
+# Measurement hook (2026-11-05): VLLM_RDNA_AR_Q8_TIMING=DIR records GPU timing events on the model stream around each
+# stage of every call and appends rank<r>.csv to DIR. Completed events are read without blocking the stream. rocprofv3
+# stalls in-server prefill, and this needs no queue interposition. Ranks leave a collective almost together, so the
+# gap before a call on each rank, compared across ranks, shows arrival skew without synchronized clocks.
+_TIMING_DIR = os.getenv("VLLM_RDNA_AR_Q8_TIMING", "")
+_TIMING_STAGES = ("quant", "exchange", "requant", "gather", "dequant")
+
+
+class _StageTimer:
+    def __init__(self, rank: int) -> None:
+        os.makedirs(_TIMING_DIR, exist_ok=True)
+        self.f = open(os.path.join(_TIMING_DIR, f"rank{rank}.csv"), "a", buffering=1)
+        self.f.write("call,host_t,rows,gap_ms," + ",".join(f"{s}_ms" for s in _TIMING_STAGES) + "\n")
+        self.pending = deque()
+        self.prev_out = None
+        self.call = 0
+
+    def mark(self, events: list) -> None:
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        events.append(ev)
+
+    def done(self, events: list, rows: int) -> None:
+        self.pending.append((self.call, time.time(), rows, self.prev_out, events))
+        self.prev_out = events[-1]
+        self.call += 1
+        while self.pending and self.pending[0][4][-1].query():
+            call, t, r, prev, evs = self.pending.popleft()
+            gap = prev.elapsed_time(evs[0]) if prev is not None else -1.0
+            stages = (a.elapsed_time(b) for a, b in zip(evs, evs[1:]))
+            self.f.write(f"{call},{t:.3f},{r},{gap:.4f}," + ",".join(f"{x:.4f}" for x in stages) + "\n")
 
 
 def enabled() -> bool:
@@ -107,6 +140,7 @@ class RdnaQ8AllReduce:
         # all-to-all enabled, which has each card receive from all three peers at once.
         self.stagger = os.getenv("VLLM_RDNA_AR_Q8_STAGGER", "1") == "1"
         self._logged = False
+        self._timer = _StageTimer(self.rank) if _TIMING_DIR else None
         logger.info("rdna_ar_q8: int8 two-shot prefill all-reduce enabled (group %d, >= %d KB, %s exchange)",
                     _G, self.min_bytes // 1024, "staggered" if self.stagger else "grouped all-to-all")
 
@@ -131,7 +165,12 @@ class RdnaQ8AllReduce:
         gath = torch.empty(mp * rowb, dtype=torch.uint8, device=dev)
         y = torch.empty((mp, H), dtype=torch.float16, device=dev)
         kw = dict(NG=ng, NGP=ngp, G=_G, H=H, ROWB=rowb, num_warps=4)
+        timer, marks = self._timer, []
+        if timer:
+            timer.mark(marks)
         _quant_pack[(mp,)](x, send, m, x.stride(0), **kw)
+        if timer:
+            timer.mark(marks)
         shard = rp * rowb
         if self.stagger:
             for k in range(1, W):
@@ -148,10 +187,19 @@ class RdnaQ8AllReduce:
                     self.comm.send(send[p * shard:(p + 1) * shard], p)
                     self.comm.recv(recv[p * shard:(p + 1) * shard], p)
             self.comm.group_end()
+        if timer:
+            timer.mark(marks)
         own = send[self.rank * shard:(self.rank + 1) * shard]
         _sum_requant[(rp,)](recv, own, red, rp, self.rank, W=W, **kw)
+        if timer:
+            timer.mark(marks)
         self.comm.all_gather(gath, red)
+        if timer:
+            timer.mark(marks)
         _dequant[(mp,)](gath, y, **kw)
+        if timer:
+            timer.mark(marks)
+            timer.done(marks, m)
         if not self._logged:
             logger.info("rdna_ar_q8: first prefill all-reduce %s via int8 two-shot", tuple(inp.shape))
             self._logged = True
