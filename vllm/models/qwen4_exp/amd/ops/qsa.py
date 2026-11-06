@@ -9,6 +9,7 @@ import math
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.utils import rdna_op_timing
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
@@ -323,6 +324,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     KV_INT8: tl.constexpr = False,
+    SCORE_DOT4: tl.constexpr = False,  # int8 query x int8 key on v_dot4 for the scores (approximates the query)
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -347,6 +349,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+    if SCORE_DOT4:
+        query_f = query.to(tl.float32)
+        query_scale = tl.maximum(tl.max(tl.abs(query_f), axis=1), 1.0e-10) / 127.0
+        query_v = query_f / query_scale[:, None]
+        query_i8 = tl.where(query_v >= 0, tl.floor(query_v + 0.5), tl.ceil(query_v - 0.5))
+        query_i8 = tl.minimum(tl.maximum(query_i8, -127.0), 127.0).to(tl.int8)
 
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
     split_tile_start = split_id * NUM_TILES // NUM_SPLITS
@@ -399,7 +407,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             # gfx1030 fork (2026-10-09): int8 per-token-head cache. int8 -> fp16 is exact; the per-(token, head)
             # fp32 scales apply to the scores (K) and to the probabilities before the PV dot (V), as in
             # triton_unified_attention.
-            keys = keys.to(query.dtype)
+            if not SCORE_DOT4:
+                keys = keys.to(query.dtype)
             values = values.to(query.dtype)
             scale_offsets = (
                 safe_page * stride_scale_block
@@ -408,7 +417,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             )
             key_scale = tl.load(k_scale_ptr + scale_offsets, mask=valid, other=0.0)
             value_scale = tl.load(v_scale_ptr + scale_offsets, mask=valid, other=0.0)
-        scores = tl.dot(query, keys)
+        if SCORE_DOT4:
+            scores = tl.dot(query_i8, keys, out_dtype=tl.int32).to(tl.float32) * query_scale[:, None]
+        else:
+            scores = tl.dot(query, keys)
         if KV_INT8:
             scores *= key_scale[None, :]
         # Scaling scores avoids re-quantizing a scaled query to BF16.
@@ -733,6 +745,20 @@ _QSA_PREFILL_BLOCK_N = _qsa_env_int("VLLM_RDNA_QSA_BLOCK_N", 32)  # prefill bran
 _QSA_PREFILL_SPLITS = _qsa_env_int("VLLM_RDNA_QSA_SPLITS", 1)
 _QSA_PREFILL_WARPS = _qsa_env_int("VLLM_RDNA_QSA_WARPS", 4)
 _QSA_STAGES = _qsa_env_int("VLLM_RDNA_QSA_STAGES", None)  # None -> 1 on ROCm, 2 elsewhere
+# gfx1030 fork (2026-11-05, VLLM_RDNA_QSA_SCORE_DOT4=1): on prefill launches with int8 KV, score with an int8 query x int8 key on v_dot4 instead of expanding the keys to
+# fp16. The query is quantized per head per row. In-server with BLOCK_N=16: sparse attention -28 %, prefill +8-9 %, NLL and recall within noise (nightly-notes/20261105.md).
+_QSA_SCORE_DOT4 = _os.getenv("VLLM_RDNA_QSA_SCORE_DOT4", "0") == "1"
+# Test hook (2026-11-05, VLLM_RDNA_QSA_TUNE_FILE): re-read "BLOCK_N WARPS STAGES SPLITS DOT4" at every prefill launch, so one boot can sweep configs on real traffic. Rank
+# configs here, not on a one-card bench: random selections on an idle card ranked them the opposite way from the server.
+_QSA_TUNE_FILE = _os.getenv("VLLM_RDNA_QSA_TUNE_FILE", "")
+
+
+def _qsa_tune_config() -> tuple[int, int, int, int, bool]:
+    with open(_QSA_TUNE_FILE) as f:
+        bn, w, st, sp, dot4 = (int(x) for x in f.read().split())
+    return bn, w, st, sp, bool(dot4)
+
+
 _QSA_OVERRIDES = {k: v for k, v in _os.environ.items() if k.startswith("VLLM_RDNA_QSA_")}
 if _QSA_OVERRIDES:
     _logging.getLogger(__name__).warning("QSA overrides active: %s", _QSA_OVERRIDES)
@@ -962,16 +988,17 @@ def qsa_select_paged_tokens(
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
-        logits, visible_blocks = qsa_mqa_paged(
-            q[row_slice],
-            k_cache,
-            page_table,
-            token_to_req[row_slice],
-            query_positions[row_slice],
-            sequence_lengths,
-            compress_ratio,
-            num_columns=num_columns,
-        )
+        with rdna_op_timing.region("idx.score"):
+            logits, visible_blocks = qsa_mqa_paged(
+                q[row_slice],
+                k_cache,
+                page_table,
+                token_to_req[row_slice],
+                query_positions[row_slice],
+                sequence_lengths,
+                compress_ratio,
+                num_columns=num_columns,
+            )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
             current_platform.is_cuda()
@@ -999,25 +1026,27 @@ def qsa_select_paged_tokens(
                 columns,
             )
         else:
-            ops.top_k_per_row_decode(
-                logits,
-                1,
-                visible_blocks,
+            with rdna_op_timing.region("idx.topk"):
+                ops.top_k_per_row_decode(
+                    logits,
+                    1,
+                    visible_blocks,
+                    blocks,
+                    blocks.shape[0],
+                    logits.stride(0),
+                    logits.stride(1),
+                    block_topk,
+                )
+        with rdna_op_timing.region("idx.expand"):
+            expand_qsa_block_indices_cuda(
                 blocks,
-                blocks.shape[0],
-                logits.stride(0),
-                logits.stride(1),
-                block_topk,
+                query_positions[row_slice],
+                sequence_lengths,
+                token_to_req[row_slice],
+                compress_ratio,
+                token_topk,
+                out[row_slice],
             )
-        expand_qsa_block_indices_cuda(
-            blocks,
-            query_positions[row_slice],
-            sequence_lengths,
-            token_to_req[row_slice],
-            compress_ratio,
-            token_topk,
-            out[row_slice],
-        )
     return out
 
 
@@ -1159,6 +1188,8 @@ def qsa_sparse_paged_attention(
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
+    score_dot4 = False
+    tune_stages = 0
     small_profile_limit = 8 if block_m <= 8 else 4
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
@@ -1184,9 +1215,15 @@ def qsa_sparse_paged_attention(
             )
             return out
         block_n, target_splits, partial_warps = _QSA_PREFILL_BLOCK_N, _QSA_PREFILL_SPLITS, _QSA_PREFILL_WARPS
+        score_dot4 = _QSA_SCORE_DOT4 and kv_int8
+        if _QSA_TUNE_FILE:
+            block_n, partial_warps, tune_stages, target_splits, score_dot4 = _qsa_tune_config()
+            score_dot4 = score_dot4 and kv_int8
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
     partial_stages = (1 if current_platform.is_rocm() else 2) if _QSA_STAGES is None else _QSA_STAGES
+    if tune_stages:
+        partial_stages = tune_stages
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
@@ -1254,6 +1291,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         KV_INT8=kv_int8,
+        SCORE_DOT4=score_dot4,
         num_warps=partial_warps,
         num_stages=partial_stages,
     )

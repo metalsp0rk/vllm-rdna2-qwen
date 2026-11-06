@@ -9,6 +9,7 @@ from typing import cast
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.utils import rdna_op_timing
 from vllm.platforms import current_platform
 from torch import nn
 
@@ -334,15 +335,17 @@ class QSAIndexer(nn.Module):
             return result
         raw_metadata, compressed_metadata = metadata
         num_tokens = raw_metadata.num_actual_tokens
-        q, token_k = self.project_qk(
-            hidden_states[:num_tokens], positions[..., :num_tokens]
-        )
-        self._update_and_compress(
-            token_k,
-            positions[..., :num_tokens],
-            raw_metadata,
-            compressed_metadata,
-        )
+        with rdna_op_timing.region("idx.project"):
+            q, token_k = self.project_qk(
+                hidden_states[:num_tokens], positions[..., :num_tokens]
+            )
+        with rdna_op_timing.region("idx.store_compress"):
+            self._update_and_compress(
+                token_k,
+                positions[..., :num_tokens],
+                raw_metadata,
+                compressed_metadata,
+            )
         if self.skip_topk:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")

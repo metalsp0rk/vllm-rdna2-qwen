@@ -11,6 +11,7 @@ import functools
 import os
 import time
 from collections import deque
+from contextlib import nullcontext
 
 import torch
 
@@ -58,6 +59,38 @@ def set_step(num_tokens: int) -> None:
         _S.prev_end = None
     elif _S.pending:
         _S.drain()
+
+
+class _Region:
+    """Times a stage inside an op, with the same rows as a wrapped op."""
+
+    __slots__ = ("name", "start", "parent")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.start = None
+
+    def __enter__(self):
+        s = _S
+        if s.active and not torch.cuda.is_current_stream_capturing():
+            self.parent = s.stack[-1] if s.stack else ""
+            self.start = s.event()
+            s.stack.append(self.name)
+        return self
+
+    def __exit__(self, *exc):
+        if self.start is not None:
+            s = _S
+            s.stack.pop()
+            s.pending.append((s.step, time.time(), s.num_tokens, self.name, self.parent, None, self.start, s.event()))
+        return False
+
+
+_NOOP = nullcontext()
+
+
+def region(name: str):
+    return _Region(name) if _DIR else _NOOP
 
 
 def wrap(name: str, fn):
