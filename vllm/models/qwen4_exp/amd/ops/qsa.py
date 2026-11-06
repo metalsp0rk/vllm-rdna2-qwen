@@ -746,7 +746,7 @@ _QSA_PREFILL_SPLITS = _qsa_env_int("VLLM_RDNA_QSA_SPLITS", 1)
 _QSA_PREFILL_WARPS = _qsa_env_int("VLLM_RDNA_QSA_WARPS", 4)
 _QSA_STAGES = _qsa_env_int("VLLM_RDNA_QSA_STAGES", None)  # None -> 1 on ROCm, 2 elsewhere
 # gfx1030 fork (2026-11-05, VLLM_RDNA_QSA_SCORE_DOT4=1): on prefill launches with int8 KV, score with an int8 query x int8 key on v_dot4 instead of expanding the keys to
-# fp16. The query is quantized per head per row. In-server with BLOCK_N=16: sparse attention -28 %, prefill +8-9 %, NLL and recall within noise (nightly-notes/20261105.md).
+# fp16. The query is quantized per head per row. In-server with BLOCK_N=16: sparse attention -28 %, prefill +8-9 %, NLL and recall within noise (docs/rdna2/CHANGES.md §22).
 _QSA_SCORE_DOT4 = _os.getenv("VLLM_RDNA_QSA_SCORE_DOT4", "0") == "1"
 # Test hook (2026-11-05, VLLM_RDNA_QSA_TUNE_FILE): re-read "BLOCK_N WARPS STAGES SPLITS DOT4" at every prefill launch, so one boot can sweep configs on real traffic. Rank
 # configs here, not on a one-card bench: random selections on an idle card ranked them the opposite way from the server.

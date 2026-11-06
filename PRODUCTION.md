@@ -70,6 +70,8 @@ down (2250, then 2100) before touching anything else.**
 | Kernel | Mainline 7.2.6 with the two amdgpu patches in `hwconfig/kernel-patches/`. |
 | ROCm | TheRock ROCm 7.14 (see [`docs/rdna2/README.md`](docs/rdna2/README.md)), with the patched ROCr runtime from [`docs/rdna2/ROCR-CPU-FIX.md`](docs/rdna2/ROCR-CPU-FIX.md) preloaded. |
 
+**Current settings, 2026-11-05:** this box now runs **115 W and 2250 MHz** (`cardinit`). The figures above were measured at 140 W, so treat them as the reasoning rather than today's values. Current speeds at 115 W are in the README.
+
 ## vLLM configuration
 
 Served with [`tools/rdna2/serve-qwen38-flash-next.sh`](tools/rdna2/serve-qwen38-flash-next.sh). Every
@@ -79,13 +81,15 @@ variable is explained in [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md
 |---|---|---|
 | `MTP` | `0` | No speculative decoding. |
 | `MAXLEN` | `262144` | Full model context. |
-| `GPUUTIL` | `0.93` | VRAM fraction for vLLM; KV cache takes the rest (~510–525k tokens). |
+| `GPUUTIL` | `0.78` | VRAM fraction for vLLM; KV cache takes the rest (420–512k tokens across today's boots, with int8 KV). This leaves about 8 GiB free per card; 0.92 gave ~1.13M tokens. Raise it if nothing else needs that VRAM. |
 | `DENSE_INT8`, `DENSE_INT8_ONLY` | `1`, `1` | int8 copies of the dense projections for decode, and the fp16 copies freed (more KV cache). |
 | `VISION` | `1` | Image input enabled. |
 | `PLE_INT4` | int4 n-gram table sidecar (~32 GB) | The n-gram table, served from host memory by the CPU offload worker. The fp8 sidecar (52.5 GB) is ~3× cleaner per row, but measured gains were small (general text within noise; −0.41 % NLL on identifier/digit-heavy text, ~1.5 SE); int4 keeps ~20 GB more RAM free. |
-| `EXTRA_ARGS` | `--prefix-cache-retention-interval 6272 --max-num-seqs 2 --kv-offloading-size 48` | Retain linear-attention state every 8 blocks along long prompts, for faster follow-up turns; at most 2 requests run at once (the rest queue); 48 GiB of CPU RAM as a second KV-cache tier (~960k tokens), so conversations evicted from the GPU reload in seconds instead of being recomputed. |
+| `EXTRA_ARGS` | `--max-num-batched-tokens 2092 --kv-cache-dtype int8_per_token_head --prefix-cache-retention-interval 6272 --max-num-seqs 2 --kv-offloading-size 32`, plus lazy offload | `2092` needs tuned rows for your rocBLAS build and is slower without them ([`CHANGES.md`](docs/rdna2/CHANGES.md) §21). `--prefix-match-unit` stays off (see [`ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md)). | Retain linear-attention state every 8 blocks along long prompts, for faster follow-up turns; at most 2 requests run at once (the rest queue); 48 GiB of CPU RAM as a second KV-cache tier (~960k tokens), so conversations evicted from the GPU reload in seconds instead of being recomputed. |
 | `VLLM_USE_SIMPLE_KV_OFFLOAD` | `1` | Required with this model for the CPU tier (see [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) §19). |
 | `PLE_OFFLOAD_ANON` | `1` | The n-gram worker keeps the 52.5 GB table in its own memory, not the page cache, so memory pressure can't evict it. Required with the CPU tier: without it, evicted table pages made lookups take seconds and desynchronised the cards. |
+| `VLLM_RDNA_QSA_SCORE_DOT4`, `VLLM_RDNA_QSA_BLOCK_N` | `1`, `16` | `v_dot4` attention scores on prefill, +8–9 %, quality within noise (§22). |
+| `VLLM_RDNA_OVERLAP_DECODE_STEPS` | `20` | Replies keep streaming during another request's long prefill (§20). |
 | `VLLM_RDNA_AR` | `1` | Custom one-shot all-reduce for decode-sized messages. |
 | `VLLM_RDNA_AR_MODE` | `wide` | 16-byte writes forming whole 128-byte lines, writes only, local waiting. The serve script's default. |
 | `VLLM_RDNA_AR_BLOCKS`, `VLLM_RDNA_AR_PACE` | `4`, `16` | Fewer concurrent write streams, with spacing between bursts. |
@@ -98,10 +102,10 @@ variable is explained in [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md
 
 **Host memory budget.** With the CPU tier, RAM is committed explicitly: the pinned tier, the resident n-gram table,
 ~6 GB per GPU worker, plus whatever else the host runs. 64 GiB of tier with the fp8 table left only ~15 GB of the
-188 GB available, so production runs 48 GiB with the int4 table (~32 GB). Size `--kv-offloading-size` so
+188 GB available, so we moved to 48 GiB with the int4 table (~32 GB), and run 32 GiB as of 2026-11-05. Size `--kv-offloading-size` so
 `MemAvailable` keeps a margin for the rest of the system.
 
-Single-stream decode is about 59.5 tokens/s at the production operating point; the published container, with its
+At the earlier 140 W operating point, single-stream decode was about 59.5 tokens/s; the published container, with its
 defaults, reaches about 64 tokens/s on the same cards. The likeliest contributor is the full **262k context** (the
 container uses 131k): decode runs as captured CUDA graphs, so the sparse-attention indexer scores against the full
 page-table capacity, which scales with the maximum context length. The table format is not the cause: measured

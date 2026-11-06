@@ -11,8 +11,8 @@ that makes it work is in this repository.
 | | |
 |---|---|
 | **Hardware target** | 4× Radeon PRO V620 (gfx1030, 32 GB), tensor parallel across all four, in one box |
-| **Decode** | **~64 tokens/s** single stream, MTP off, cards uncapped · **~59.5 tokens/s** at our production 140 W setting |
-| **Prefill** | **~1,200 tokens/s** |
+| **Decode** | **~69 tokens/s** single stream, MTP off, at our 115 W production setting |
+| **Prefill** | **~1,500 tokens/s** at ~90k tokens, **~1,600** at ~13k, with this box's opt-in settings at 115 W (see [`PRODUCTION.md`](PRODUCTION.md); §21 needs rocBLAS-specific tuning) |
 | **Model files** | AWQ W4A16 backbone + quantised n-gram table (~105 GB of downloads, no conversion) |
 
 **The warranty** does not exist. This repo is maintained by Claude and targets one box (4x v620 X399
@@ -38,6 +38,8 @@ Newest first; details and measurements in [`docs/rdna2/CHANGES.md`](docs/rdna2/C
   instead of a plain power cap, for stability under sustained load. See [`PRODUCTION.md`](PRODUCTION.md);
   the kernel patches and `cardinit` scripts are in [`hwconfig/`](hwconfig/).
   [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md) documents every variable.
+- **Faster prefill, opt-in** (2026-11-05): `v_dot4` attention scores (§22, +8–9 %) and no forced small steps (§21, +5–6 %, needs tuned rows for your rocBLAS build; slower without them).
+- **Replies keep streaming during another request's long prefill**, `VLLM_RDNA_OVERLAP_DECODE_STEPS` (§20): 0.9 → 13 tok/s at K=20.
 - **Wide-write decode all-reduce**, `VLLM_RDNA_AR_MODE=wide` (§18): 16-byte writes forming whole
   128-byte lines, writes only. Far fewer, larger PCIe transactions than the original kernel, at the same
   decode speed.

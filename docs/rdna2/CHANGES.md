@@ -20,6 +20,10 @@ PLE-offload verification at build time). The entrypoint is the serve script; wei
 `/models`. TheRock publishes no gfx103X torch wheels, and the 7.14 line has moved off AMD's current
 channels — the published base image is the durable artifact. See containers/README.md.
 
+**2026-11-05 — prefill +5–6 % from removing forced small steps, +8–9 % from `v_dot4` attention scores.** Both are opt-in; see §21 and §22. Prefill on this box at 115 W is now about 1,500 tok/s at ~90k tokens and 1,600 at ~13k. A timing method that works where the profiler stalls is in §23, with what it found.
+
+**2026-10-11 — a reply keeps streaming during another request's long prefill.** Decode during overlap went from 0.9 to 13 tok/s at about the same prefill cost; see §20.
+
 **2026-10-09 — MoE decode kernels v2/v3, decode batches up to 16.** The routed-expert decode pair was
 rewritten (v2: 16-byte weight loads, no shared-memory activation staging, EP-local slot compaction) and the
 small-batch kernels (int8/fp16 GEMV, the fused glue ops) now take batches up to 16, so a 9–16-request decode
@@ -983,3 +987,78 @@ before resuming — 12 GB per rank took 5–20 s. Eviction jumps line up with `p
   (unlimited is simplest) for the vLLM process, `vm.compact_unevictable_allowed=0`, and preferably
   `vm.compaction_proactiveness=0` (background compaction was the largest source of migrations). See
   `hwconfig/README.md`.
+
+---
+
+## 20. Decode during another request's prefill, `VLLM_RDNA_OVERLAP_DECODE_STEPS` (2026-10-11)
+
+vLLM schedules decodes and prefill in the same step, so a decoding request gets one token per step, and a step carrying a 2048-token chunk takes well over a second. Next to a long prefill, a reply gets less than 1 token/s.
+
+Measured with a decode running beside an uncached ~90k-token prompt, 2 rounds per setting (`tools/rdna2/overlap_bench.py`):
+
+| Setting | Decode during overlap | Prefill during overlap | Prefill time vs solo |
+|---|---|---|---|
+| off | 0.9 tok/s | ~1,160 tok/s | 1.2–1.4× |
+| `VLLM_RDNA_OVERLAP_STEP_TOKENS` 512 / 256 / 128 | 1.4 / 2.3 / 3.2 | 637 / 562 / 388 | 2.1–2.4× / 2.5–2.9× / 3.8× |
+| `VLLM_RDNA_OVERLAP_DECODE_STEPS` 10 / 20 / 40 | **7.6 / 13.2 / 21.6** | 1,050 / 963 / 813 | 1.5× / 1.35× / 1.87× |
+
+Smaller mixed steps do not work on this model: a mixed step has a large fixed cost however few tokens it carries. Alternating does, because a decode-only step is about 15–19 ms. After a step that ran prefill next to a decode, the scheduler runs K decode-only steps. With no decode running, prefill keeps full chunks, and solo prefill and decode are unchanged. We run K=20. Shorter prompts have faster prefill steps, so decode during overlap should be higher for the same K. Not in the compile key.
+
+## 21. Removing forced small prefill steps, `--max-num-batched-tokens 2092` (2026-11-05)
+
+With `--prefix-cache-retention-interval 6272`, a step must end at every 6,272-token boundary, and 6,272 is not a multiple of 2048. Prefill therefore ran **2048, 2048, 2048, 128** repeatedly. The 128-token steps took ~8 % of the time for 2 % of the tokens (about 340 vs 1,459 tok/s). With 2092 the steps are 2092, 2092, 2088, which land on the boundaries.
+
+Same-session at 115 W, in both orders:
+
+| Setting | ~13k tok/s | ~85–95k tok/s | Small steps |
+|---|---|---|---|
+| 2048 | 1,400–1,443 | 1,300–1,326 | 33–35 |
+| **2092, tuned rows** | **1,473–1,509** | **1,375–1,399** | **0** |
+| 2092, untuned | 806–1,248 | 1,148–1,159 | 0 |
+| interval 12544 instead | 1,451–1,486 | 1,354–1,368 | 18 |
+
+Follow-up cache hits were unchanged and `validate.py` passed.
+
+**Not the fork's default, and do not copy it blindly.** It is only faster with TunableOp rows for M=2088 and 2092, and those exist only for `rocblas-3b4878bc6c37` (`tunableop/README.md`). Untuned it is ~15 % *slower* than 2048. The published container (`rocblas-9847aecc4bf8`) has no such rows. The value is also tied to the 6272 interval. To use it on another build: boot once with `TUNEOP_TUNING=1`, caps low and prompts paced, then stop gracefully. The first boot with a new value compiles cold, and early prompts run slow while kernels compile.
+
+## 22. Attention scores on `v_dot4`, `VLLM_RDNA_QSA_SCORE_DOT4` (2026-11-05)
+
+On prefill batches with int8 KV, the sparse attention kernel scores with an int8 query × int8 key on `v_dot4` instead of expanding each key to fp16. The query is quantized per head, per row. The PV dot is unchanged. Use `VLLM_RDNA_QSA_BLOCK_N=16` with it: the best tile changed from 32 to 16.
+
+| In-server, 115 W, 2092-token steps | Baseline | dot4, tile 16 |
+|---|---|---|
+| Sparse attention per layer, ~87k | 25.7 ms | **18.3 ms** |
+| Prefill, ~87k | 1,365–1,367 tok/s | **1,476–1,494 tok/s** |
+| Decode | 70.1 t/s | 70.7 t/s |
+
+**Quality.** Baseline and dot4 alternated on one boot, so re-running each arm gives the noise floor. Over 180k tokens of long real text, including a 59k-token prompt, the mean logprob change was 0.218–0.219 between arms, against 0.196–0.199 for re-runs of the same arm; NLL/token moved −0.007 (noise 0.003–0.004), which we do not claim as an improvement. Short texts: +0.003 and −0.018. Needle recall was 15/15 both ways to 131k tokens. Long texts matter here: at about 700 tokens, top-k keeps everything and the test barely exercises selection.
+
+**A bench misled us, again.** On one idle card with random selections, CU mode and fewer warps looked up to 38 % faster; in-server all were slower (BN=16, 1 warp, CU: 7.7 ms on the bench, 37.5 ms in-server). So we sweep in-server: `VLLM_RDNA_QSA_TUNE_FILE` and `tools/rdna2/qsa_tune.py` test about one config per minute on one boot, with real selections, all four cards and the real KV layout.
+
+**Tested in-server and rejected:** the tile/warps/stages grid with fp16 scores (32/4/1 was best), per-kernel CU mode, selections sorted by position (gain cancelled by the sort), indexer tile/warps/stages, `schedule_hint=memory-bound-attention`, and KV under 2 GiB, which enables Triton's buffer ops (kernels ~1–10 % faster, no measurable whole-step gain). The indexer's scoring is ~1 % of a step at ~13k and ~5 % at ~87k.
+
+This has only been tested on this box. The query is approximated, so re-check quality on your own workload.
+
+## 23. Measuring prefill without a profiler (2026-11-05)
+
+`rocprofv3 --kernel-trace` stalls in-server prefill here: throughput reaches zero within about 15 s of tracing starting (`queue_interposition.cpp: Async signal handler still waiting on signal`) and no trace is written. It happened with the custom all-reduce and patched ROCr on or off, the window opening idle or mid-request, and the int8 all-reduce staggered, grouped or off. Decode traces still work. RCCL under tracing is the leading suspect, unproven; the kernel log and AER counters showed no hardware fault.
+
+These hooks use HIP timing events on the model stream instead, read back only after they complete, so nothing blocks and no queue is interposed:
+
+- `VLLM_RDNA_OP_TIMING`: GPU time per custom op, because custom ops are opaque to `torch.compile`; `rdna_op_timing.region()` times stages inside an op. About 1–2 % overhead. Report: `tools/rdna2/op_timing_report.py`.
+- `VLLM_RDNA_AR_Q8_TIMING`: per-stage times of each int8 all-reduce. Ranks leave a collective nearly together, so per-rank waits can be read without synchronized clocks. No measurable overhead.
+- `PLE_OFFLOAD_STEP_TIMING`: host time around `prepare_forward`.
+
+Where a prefill step went, measured before §22 (rank 0, 115 W, 2092-token steps):
+
+| Op | ~13k prompt | ~87k prompt |
+|---|---|---|
+| MoE experts | 22.6 % | 22.3 % |
+| QSA (indexer + sparse attention) | 21.4 % | 26.9 % |
+| All-reduce | 14.6 % | 11.3 % |
+| Hyper-connection mixers | 13.9 % | 13.6 % |
+| Dense projections | 10.8 % | 10.2 % |
+| GDN core | 6.3 % | 6.0 % |
+| Other, including ~51 ms n-gram lookup | 4.7 % | 4.7 % |
+
+Moving data takes ~9–10 % of wall time, and waiting plus slower links a few percent more, so all-reduce overlap and expert balancing have less to win than the older 23–27 % figure suggested. The mixers are `ReplicatedLinear`: every rank does all the tokens, so tensor parallelism does not help them.

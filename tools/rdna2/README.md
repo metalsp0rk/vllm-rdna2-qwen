@@ -15,6 +15,10 @@ The scripts that built, served, measured and validated the configuration in
 |---|---|---|
 | `bench.py [runs] [max_tokens]` | the decode yardstick: streamed completion, t/s first→last chunk | host, against the running server |
 | `bench_ctx.py <ctx_tokens> [max_tokens] [runs]` | decode t/s at a context length, unique prompts (no prefix-cache hits) | host |
+| `prefill_load.py --tokens N [--count K] [--loop]` | uncached prefill load (fresh nonce per prompt), prints tok/s per prompt | host, against the running server |
+| `overlap_bench.py [--size N] [--rounds R]` | decode rate during another request's prefill, and that prefill vs solo; `--size 16000` is really ~90k tokens | host, against the running server |
+| `op_timing_report.py DIR` | GPU time per custom op on prefill steps, from `VLLM_RDNA_OP_TIMING=DIR` csvs | host, after the server stops |
+| `qsa_tune.py OUTDIR TUNEFILE CFG...`, `--report OUTDIR` | in-server sweep of the sparse attention prefill kernel on one boot (`VLLM_RDNA_QSA_TUNE_FILE`) | host, against the running server |
 | `trace_agg.py <trace.json.gz> [top]` | kernel time by family / top kernels / GPU busy from a torch-profiler trace | host (`logs/traces/`) |
 | `trace_attr.py <trace.json.gz> <steps>` | eager-mode attribution: kernel → CPU op → innermost model source line | host; needs an `EAGER=1 PROFILE=1` boot |
 | `gemm_probe.py` | production GEMM route vs rocBLAS on the model's 12 dense shapes | on a free card |

@@ -142,12 +142,12 @@ All of these cut kernel launches or wasted work per decode step; launch overhead
 
 **int8 KV cache (`--kv-cache-dtype int8_per_token_head`).** The 12 full-attention (QSA) layers can keep their main
 K/V cache as int8 with one fp32 scale per token and head (absmax/127). This about doubles the KV-cache token
-capacity at unchanged decode and prefill speed: on 4 × V620 at `GPUUTIL=0.93`, 482k → 939k tokens. Needle retrieval
+capacity at about 1.5 % slower decode and unchanged prefill: on 4 × V620 at `GPUUTIL=0.93`, 482k → 939k tokens. Needle retrieval
 at 32k/64k was unchanged (10/10), and greedy output stays within near-tie noise of the fp16 cache. The QSA indexer
 caches stay fp16; they are about 3 % of the per-token bytes. gfx1030 has no fp8 hardware, so use int8 rather than
 the fp8 cache types. Changing the flag changes the compile cache key, so expect one cold boot.
 
-**Turn-boundary prefix hits (`--prefix-match-unit 16`).** Recommended for chat and agent use. Prefix-cache keys
+**Turn-boundary prefix hits (`--prefix-match-unit 16`).** **Off in our production; use with care.** With it on, a long real chat on this box (2026-10-09) lost a turn, then kept answering the turn before the last, and later replies in that session stayed unusually terse. It stopped after removing the flag and starting a new session. The test probes had not caught it, the root cause is unconfirmed, and no reproduction exists yet. Without it, a follow-up recomputes up to one block, roughly 0.5–1 s at prefill speed. Prefix-cache keys
 are then computed every 16 tokens instead of every 784-token block. Together with the scheduler tail stop above,
 each prompt saves its linear-attention state just before its generation prompt. A follow-up turn then
 recomputes only its new message plus a few template tokens: about 50–90 tokens. Before, it was up to one
@@ -166,7 +166,9 @@ coarser, and up to ~1.5k tokens of a cached conversation are recomputed per turn
 | `VLLM_RDNA_QSA_BOUND_MIN_TOKENS` | `512` | For eager prefill batches of at least this many tokens, the indexer scores only the compressed keys that can actually be visible, not the page table's full capacity. Smaller and graph-captured batches keep full capacity, so a captured graph never bakes in a column count. |
 | `VLLM_RDNA_QSA_DOT` | `0` | `1`: use the blocked `tl.dot` scoring kernel (roughly parity). Tile: `VLLM_RDNA_QSA_DOT_BLOCK_M` / `_BLOCK_N` / `_WARPS` / `_STAGES` (16 / 32 / 8 / 1). |
 | `VLLM_RDNA_QSA_MQA_BLOCK_N` / `_MQA_WARPS` / `_MQA_STAGES` | `128` / `8` / Triton default | Tile of the indexer's scoring kernel. |
-| `VLLM_RDNA_QSA_BLOCK_N` / `_SPLITS` / `_WARPS` / `_STAGES` | `32` / `1` / `4` / `1` on ROCm | Tile of the sparse-attention prefill kernel. `num_stages=1` matters on this chip: Triton's AMD default of 2 halves occupancy. |
+| `VLLM_RDNA_QSA_SCORE_DOT4` | `0` | §22. With int8 KV, on prefill batches: score with an int8 query × int8 key on `v_dot4` instead of expanding keys to fp16. With `VLLM_RDNA_QSA_BLOCK_N=16`, sparse attention −28 % and prefill +8–9 % on 4 × V620; NLL and needle recall within noise. The query is approximated, so re-check quality on your own workload. |
+| `VLLM_RDNA_QSA_TUNE_FILE` | unset | Test only (§22): re-read `BLOCK_N WARPS STAGES SPLITS DOT4` from this file at every prefill launch, for one-boot in-server sweeps with `tools/rdna2/qsa_tune.py`. |
+| `VLLM_RDNA_QSA_BLOCK_N` / `_SPLITS` / `_WARPS` / `_STAGES` | `32` / `1` / `4` / `1` on ROCm | Tile of the sparse-attention prefill kernel. Use `BLOCK_N=16` with `VLLM_RDNA_QSA_SCORE_DOT4=1` (§22). `num_stages=1` matters on this chip: Triton's AMD default of 2 halves occupancy. |
 | `VLLM_RDNA_QSA_DESPILL` | `0` | Use a register-lean variant of the sparse prefill kernel: 1.17× in isolation, no end-to-end gain. |
 | `VLLM_RDNA_QSA_DUMP` | unset | Debug: a directory to dump the indexer's inputs and outputs on a few large calls. Synchronises the GPU; never set it in production. |
 
@@ -181,6 +183,8 @@ Any `VLLM_RDNA_QSA_*` override is logged as a warning at startup.
 | `VLLM_RDNA_MAMBA_RETENTION_STOPS` | `1` | End prefill steps exactly at the ends of the linear-attention state blocks (784 tokens) that the prefix cache retains. The saved state is only exact when a step ends on a block boundary. Without this, a follow-up turn on a long conversation could re-prefill tens of thousands of tokens (e.g. 31 s instead of seconds to first token). |
 | `VLLM_RDNA_MAMBA_TAIL_STOP` | `1` | With `--prefix-match-unit`, also end a prefill step at the prompt's last match boundary. The partial-tail state saved there is what lets a follow-up turn resume within a few tokens of the previous prompt's end, instead of at its last full 784-token block. Without `--prefix-match-unit` it does nothing. |
 | `VLLM_RDNA_PROMPT_TAIL_BACKOFF` | `4` | How many tokens before the prompt end the partial-tail state is placed. A chat follow-up re-renders the previous generation prompt (Qwen's empty think block is 4 tokens), so a state saved at the very end would sit past where the next prompt diverges. `0` restores upstream. |
+| `VLLM_RDNA_OVERLAP_DECODE_STEPS` | `0` | §20. After a step that ran prefill next to a decoding request, run this many decode-only steps before the next prefill chunk, so a reply keeps streaming during another request's long prefill. At ~90k tokens: decode 0.9 → 7.6 / 13.2 / 21.6 tok/s at 10 / 20 / 40, prefill 1.5× / 1.35× / 1.87× its solo time (1.2–1.4× with it off). We use 20. |
+| `VLLM_RDNA_OVERLAP_STEP_TOKENS` | `0` | §20. Cap steps at this many tokens while decoding. **Not recommended:** small mixed steps are very inefficient here (1.4–3.2 tok/s decode at 2.1–3.8× prefill time). |
 | `ALLOW_TRITON_DRIFT` | `0` | The serve script refuses to start unless the installed Triton is the pinned gfx1030 build in `tools/rdna2/constraints-gfx1030.txt`. Upstream Triton dropped RDNA2 targets on 2026-09-30, so a newer Triton changes how every custom kernel is compiled. Set `1` only for deliberate Triton experiments. |
 
 ---
@@ -228,6 +232,9 @@ CPU worker process serves lookups from host memory, and the GPUs wait for its re
 
 | Variable | Used by | Meaning |
 |---|---|---|
+| `VLLM_RDNA_OP_TIMING` | `tools/rdna2/op_timing_report.py` | §23. A directory: record GPU time per custom op on prefill steps of at least `VLLM_RDNA_OP_TIMING_MIN_TOKENS` (1024) tokens. About 1–2 % overhead. |
+| `VLLM_RDNA_AR_Q8_TIMING` | analysis by hand | §23. A directory: GPU time per stage of each int8 all-reduce, per rank. No measurable overhead. |
+| `PLE_OFFLOAD_STEP_TIMING` | analysis by hand | §23. A directory: host time per phase of `prepare_forward` on each step, per rank. |
 | `RDNA_AR_TEST_SO` | `tools/rdna2/ar_ops_test.py` | Path to a freshly built `_rocm_C` library to test without installing it (e.g. `build_rocm/_rocm_C.abi3.so`). |
 | `RDNA_AR_TEST_MAXB` | `tools/rdna2/ar_ops_test.py` | Staging size (bytes) for the all-reduce under test. |
 
