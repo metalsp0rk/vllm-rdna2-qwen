@@ -728,7 +728,6 @@ class QSAIndexerMetadataBuilder(AttentionMetadataBuilder[QSAIndexerMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
-            max_seq_len=int(common_attn_metadata.max_seq_len),
         )
 
 
