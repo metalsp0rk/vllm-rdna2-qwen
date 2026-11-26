@@ -845,9 +845,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         embeddings = self.ple_embedding(
             hidden_states, input_ids, query_start_loc, ngram_context
         )
-        embeddings = self.ple_embedding.ngram_embedding.dequantize(
-            embeddings, hidden_states.dtype
-        )
+        # The GPU worker skips this constructor so the nested table is never
+        # allocated. The CPU worker already dequantized into the buffer above.
+        if not self.ple_embedding._is_cpu_offloaded:
+            embeddings = self.ple_embedding.ngram_embedding.dequantize(
+                embeddings, hidden_states.dtype
+            )
         kv, _ = self.kv_proj(embeddings)
         key, value = kv.split(self.kv_proj.output_sizes, dim=-1)
         gated_output, conv_input = torch.ops.vllm.qwen4_exp_ple_gate(
