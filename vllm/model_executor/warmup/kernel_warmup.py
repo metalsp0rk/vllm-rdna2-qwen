@@ -319,18 +319,27 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         watermark_sample_warmup(worker)
         qwen4_exp_qsa_triton_warmup(worker)
 
-    if enable_jit_warmup and current_platform.is_device_capability_family(100):
+    # gfx1030 is GCN (10, 3), so family(100) and has_capability(90) are both
+    # true there. Those gates mean CUDA Blackwell/Hopper, not RDNA2.
+    if (
+        enable_jit_warmup
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(100)
+    ):
         _warmup_bf16x3_router_gemm(
             worker.get_model(),
             worker.scheduler_config.max_num_batched_tokens,
         )
 
-    if current_platform.has_device_capability(90):
+    if current_platform.is_cuda() and current_platform.has_device_capability(90):
         _warmup_ll_bf16_router_gemm(worker.get_model())
 
     _warmup_gemm_rs_ar()
 
-    if worker.vllm_config.kernel_config.enable_cutedsl_warmup:
+    if (
+        current_platform.is_cuda()
+        and worker.vllm_config.kernel_config.enable_cutedsl_warmup
+    ):
         # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
         # to the shared JIT warmup infrastructure.
         # https://github.com/vllm-project/vllm/pull/47451
@@ -388,7 +397,11 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if enable_flashinfer_autotune is False:
         logger.info_once("Skipping FlashInfer autotune because it is disabled.")
-    elif has_flashinfer() and current_platform.has_device_capability(90):
+    elif (
+        has_flashinfer()
+        and current_platform.is_cuda()
+        and current_platform.has_device_capability(90)
+    ):
         with _outside_kv_cache_transient_window(worker):
             flashinfer_autotune(worker.model_runner)
 
