@@ -596,11 +596,10 @@ class QSAIndexerMetadata(AttentionMetadata):
     num_prefill_tokens: int
     max_query_len: int
     decode_query_len: int
-    max_seq_len: int
+    max_seq_len: int  # host-side, for bounding the indexer's scored columns (2026-09-24)
     # Key rows per physical cache block.
     storage_block_size: int
     compress_ratio: int
-    max_seq_len: int = 0  # host-side, for bounding the indexer's scored columns (2026-09-24)
 
 
 class QSAIndexerMetadataBuilder(AttentionMetadataBuilder[QSAIndexerMetadata]):
