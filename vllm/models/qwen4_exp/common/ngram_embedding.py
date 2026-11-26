@@ -7,6 +7,7 @@ n-gram embedding table can be kept in pinned host memory and looked up through
 Unified Virtual Addressing on any CUDA-alike platform.
 """
 
+import os
 import threading
 from abc import ABC, abstractmethod
 from typing import ClassVar
@@ -56,6 +57,23 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from .ple import PLEVocabParallelEmbedding
 
 logger = init_logger(__name__)
+
+
+def _ple_spill_dir() -> str | None:
+    """Return the configured PLE sidecar or disk-spill directory, if any.
+
+    ``vllm/v1/ple_offload/worker.py`` replaces the table parameter with a
+    sidecar-backed store before any weight is read from the checkpoint, so the
+    full-size parameter only has to carry its shape: it must stay unmaterialized
+    virtual memory and must not be pinned or UVA-registered (a 95 GiB pin locks
+    every page and fails outright on hosts that rely on the sidecar).
+    """
+    return (
+        os.getenv("VLLM_PLE_QUANT_DIR")
+        or os.getenv("VLLM_PLE_DISK_OFFLOAD_DIR")
+        or None
+    )
+
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
@@ -654,7 +672,11 @@ def _lookup_ple_embedding_from_pinned_kernel(
 
 
 class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
-    """PLE table loaded into pinned CPU memory and looked up through UVA."""
+    """PLE table loaded into pinned CPU memory and looked up through UVA.
+
+    With ``VLLM_PLE_QUANT_DIR``/``VLLM_PLE_DISK_OFFLOAD_DIR`` set the offload
+    worker swaps the table for a spill store, so no resident copy is allocated.
+    """
 
     supports_prefetch: ClassVar[bool] = True
 
@@ -686,7 +708,11 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             data_parallel_rank=data_parallel_rank,
             reduce_results=reduce_results,
         )
-        self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
+        self._uva_weight: torch.Tensor | None = (
+            None
+            if _ple_spill_dir() is not None
+            else get_accelerator_view_from_cpu_tensor(self.weight)
+        )
         self._prefetch_stream: torch.cuda.Stream | None = None
         self._prefetch_buffer: torch.Tensor | None = None
         self._prefetch_alloc_lock = threading.Lock()
@@ -700,7 +726,15 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         embedding_dim: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Allocate the complete PLE weight directly in pinned CPU memory."""
+        """Allocate the complete PLE weight directly in pinned CPU memory.
+
+        With a quantized sidecar or disk spill configured the parameter is
+        replaced before loading, so it is allocated as plain unpinned virtual
+        memory: the shape still drives the spill attach, but no page is
+        materialized or locked.
+        """
+        if _ple_spill_dir() is not None:
+            return torch.empty(num_embeddings, embedding_dim, dtype=dtype)
         return torch.empty(
             num_embeddings,
             embedding_dim,
@@ -709,12 +743,23 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             pin_memory=True,
         )
 
+    def _require_resident_weight(self) -> torch.Tensor:
+        """Return the UVA view, rejecting lookups served from a spill store."""
+        if self._uva_weight is None:
+            raise RuntimeError(
+                "pinned PLE lookup needs a resident pinned table, but a PLE "
+                "sidecar/disk spill is configured; gathers are served by the "
+                "spill store instead"
+            )
+        return self._uva_weight
+
     def _lookup(
         self,
         input_ids: torch.Tensor,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Look up local ETP rows in the embedding method's lookup dtype."""
+        self._require_resident_weight()
         expected_shape = (*input_ids.shape, self.embedding_dim)
         lookup_dtype = self.embedding_method.lookup_dtype(self)
         if output is None:
@@ -768,6 +813,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
     @eager_break_during_capture
     def start_prefetch(self, ngram_ids: torch.Tensor) -> None:
         """Gather ETP IDs and launch their UVA lookup on the side stream."""
+        uva_weight = self._require_resident_weight()
         buffer = self._prefetch_buffer
         if buffer is None:
             # First use allocates. The eager profile run always precedes
@@ -783,14 +829,14 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
                             "eagerly, before cudagraph capture"
                         )
                     self._prefetch_stream = torch.cuda.Stream(
-                        device=self._uva_weight.device
+                        device=uva_weight.device
                     )
                     buffer = torch.empty(
                         self._prefetch_rows,
                         self._num_ngram_heads,
                         self.embedding_dim,
                         dtype=self.embedding_method.lookup_dtype(self),
-                        device=self._uva_weight.device,
+                        device=uva_weight.device,
                     )
                     self._prefetch_buffer = buffer
         prefetch_stream = self._prefetch_stream

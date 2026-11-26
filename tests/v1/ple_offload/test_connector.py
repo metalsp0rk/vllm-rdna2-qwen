@@ -150,6 +150,7 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
     assert final_ptrs != initial_ptrs
 
     connector._pinned_input_buffers = []
+    connector._out_bufs = {}  # set by _attach_output_buffers in real init
     connector._request_queue = queue.Queue(maxsize=1)
     connector._launch_seq = 0
     connector._t_launch = connector._t_wait = connector._t_stage = 0.0
