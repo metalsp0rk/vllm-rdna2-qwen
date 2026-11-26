@@ -1632,8 +1632,13 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   # build spends its entire length compiling that single file.
   # skinny_gemms_int4_api.cu keeps the public entry point and dispatches on N_in,
   # with extern template keeping the device code in the five units.
+  # skinny_gemms_int4_fork_host.cu holds the fork's host-side decode entry
+  # points (MoE int4 v1/v2/v3, dense gemv fp16/int8): their kernels live in
+  # skinny_gemms_int4.cuh but they must be defined in exactly one unit, so
+  # they do not belong in that shared header (see the file's own note).
   set(VLLM_SKINNY_INT4_SRC
     "csrc/rocm/skinny_gemms_int4_api.cu"
+    "csrc/rocm/skinny_gemms_int4_fork_host.cu"
     "csrc/rocm/skinny_gemms_int4_n1.cu"
     "csrc/rocm/skinny_gemms_int4_n2.cu"
     "csrc/rocm/skinny_gemms_int4_n3.cu"
