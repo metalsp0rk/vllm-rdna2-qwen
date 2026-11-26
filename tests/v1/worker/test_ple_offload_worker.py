@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import msgspec
@@ -215,6 +214,13 @@ def test_offloaded_forward_waits_then_releases_output(
         "ple_offload_wait",
         lambda *args: wait_calls.append(args),
     )
+    # This test exercises the GPU-doorbell (semaphore) path: forward() and
+    # release_offloaded_output() gate on the module-level PLE_GPU_FLAG
+    # (env PLE_OFFLOAD_GPU_FLAG, default off), read at call time. Pin it on
+    # so the test is independent of the ambient environment (it silently
+    # failed with the flag off -- reproduced unchanged on the pre-rebase
+    # tree, so this predates the v0.34.0 rebase).
+    monkeypatch.setattr(ple_offload_layer, "PLE_GPU_FLAG", True)
 
     layer = _TestPleOffloadLayer()
     layer._is_cpu_offloaded = True
@@ -515,14 +521,15 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
     assert set(runner._pinned_bufs) == {0, 1}
 
 
-def test_ple_offload_runner_routes_requests_layer_first(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_ple_offload_runner_handles_requests_in_order() -> None:
     events = []
 
     class FakeLayer:
         def __init__(self, name: str):
             self.name = name
+            # No fused fast path: _fused_decode_lookup bails to forward_impl
+            # (None), which is the routing behaviour under test.
+            self.ngram_embedding = None
 
         def forward_impl(
             self,
@@ -550,17 +557,30 @@ def test_ple_offload_runner_routes_requests_layer_first(
             del stream
 
     def target():
+        # The CPU tensor stands in for the IPC-mapped GPU buffer; the shared
+        # pinned result buffer (out_buf, set at registration in production)
+        # aliases it so the result rows land where the asserts read them.
+        buf = torch.empty(4, 2, dtype=torch.int32)
         return ple_offload_worker.PleOffloadOutputTarget(
             tp_rank=0,
-            gpu_output_buffer=torch.empty(4, 2, dtype=torch.int32),
+            gpu_output_buffer=buf,
             sem=FakeSemaphore(),
             copy_stream=FakeStream(),  # type: ignore[arg-type]
+            out_buf=buf,
         )
 
     runner = ple_offload_worker.PleOffloadRunner.__new__(
         ple_offload_worker.PleOffloadRunner
     )
     runner._clamp_input_ids = True
+    # Mirror the per-loop state busy_loop()/registration install on this
+    # __new__-built runner (PLE_OFFLOAD_* hooks at defaults).
+    runner._debug_delay_s = 0.0
+    runner._debug_trace = None
+    runner._fused_check = False
+    runner._done_seq = {}
+    runner._t_lookup = runner._t_total = 0.0
+    runner._n_timed = runner._n_fused = 0
     runner._layers = {"ple0": FakeLayer("ple0"), "ple1": FakeLayer("ple1")}
     runner._worker_targets = {
         0: {"ple0": [target()], "ple1": [target()]},
@@ -585,11 +605,6 @@ def test_ple_offload_runner_routes_requests_layer_first(
         }
         for dp_rank in range(2)
     }
-    monkeypatch.setattr(
-        ple_offload_worker.torch.cuda,
-        "stream",
-        lambda _: nullcontext(),
-    )
 
     runner._handle_requests(
         [
@@ -606,10 +621,16 @@ def test_ple_offload_runner_routes_requests_layer_first(
         ]
     )
 
+    # Protocol (2026-08-30 doorbell rework): at most one request per DP rank
+    # is ever outstanding; a drain holding several is a protocol violation,
+    # handled strictly in arrival order (each request then runs its layers
+    # first). The two requests below simulate such a violation; the old
+    # expectation batched all requests per layer, semantics that died with
+    # the launch-seq/doorbell rework (this test predates the v0.34.0 rebase).
     assert events == [
         ("ple0", 0),
-        ("ple0", 20),
         ("ple1", 0),
+        ("ple0", 20),
         ("ple1", 20),
     ]
     torch.testing.assert_close(
