@@ -60,11 +60,14 @@ from vllm.model_executor.layers.ple_offload_layer import (
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
 )
-from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weights
+from vllm.model_executor.model_loader.weight_utils import (
+    initialize_single_dummy_weight,
+)
 from vllm.utils.system_utils import decorate_logs, get_mp_context
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.ple_offload.protocol import (
@@ -1088,16 +1091,23 @@ class PleOffloadRunner:
                 len(offload_layers),
             )
             for layer in offload_layers.values():
-                # The model was built under torch.device("meta"), and
-                # initialize_dummy_weights fills existing storage -- it cannot
-                # materialize meta tensors. The DefaultModelLoader path gets
+                # The model was built under torch.device("meta"), and the
+                # dummy-weight fill below populates existing storage -- it
+                # cannot materialize meta tensors. The DefaultModelLoader path gets
                 # storage implicitly by copying checkpoint data in; the dummy
                 # path has to ask for it, or the layer's parameters and its
                 # persistent buffers (layer_multipliers, ngram_heads_*) stay on
                 # meta and the first forward dies with
                 # "Tensor on device meta is not on the expected device cpu".
                 layer.to_empty(device=torch.device("cpu"))
-                initialize_dummy_weights(layer, model_config)
+                # v0.34.0 split the whole-model initialize_dummy_weights() into
+                # the per-tensor initialize_single_dummy_weight() plus a loop in
+                # DummyModelLoader; PLE offload layers never reach that loop (the
+                # real loader takes their weights), so run the same fill here --
+                # params and persistent buffers, per-tensor dtype rules included.
+                for name, tensor in get_layer_tensors(layer).items():
+                    if name not in layer._non_persistent_buffers_set:
+                        initialize_single_dummy_weight(tensor, name=name)
         elif isinstance(loader, DefaultModelLoader):
             all_weights = loader.get_all_weights(model_config, model)
             loaded_params = model.load_weights(offload_only_iter(all_weights))
