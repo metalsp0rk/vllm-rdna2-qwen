@@ -123,36 +123,54 @@ def _ple_ngram_ids_cpu(
     eos_token_id: int,
     heads_per_ngram: int,
 ) -> None:
-    """Hash n-gram ids without Triton. The offload worker's tensors are CPU."""
-    tokens = input_ids.reshape(-1).tolist()
-    if not tokens:
+    """Hash n-gram ids without Triton. The offload worker's tensors are CPU.
+
+    One output row per input token, matching the Triton kernel's binary search
+    over ``query_start_loc``. Reconstructing history and counting positions
+    disagrees with padded or short batches and kills the worker.
+    """
+    tokens = input_ids.reshape(-1).to(dtype=torch.int64)
+    num_tokens = tokens.numel()
+    if num_tokens == 0:
         return
-    starts = query_start_loc.tolist()
-    contexts = ngram_context.tolist()
-    multipliers = layer_multipliers.cpu()
-    sizes = ngram_heads_vocab_sizes.cpu()
-    offsets = ngram_heads_offsets.cpu()
-    context_len = len(contexts[0])
-    rows = []
-    for req, (start, end) in enumerate(zip(starts, starts[1:])):
-        history = contexts[req] + tokens[start:end]
-        for pos in range(context_len, len(history)):
-            shifted = [history[pos]]
-            crossed_eos = False
-            for shift in range(1, context_len + 1):
-                token = eos_token_id if crossed_eos else history[pos - shift]
-                shifted.append(token)
-                crossed_eos |= token == eos_token_id
-            mixed = torch.tensor(shifted[0], dtype=torch.int64) * multipliers[0]
-            row = []
-            for ngram_order in range(2, context_len + 2):
-                shift = ngram_order - 1
-                mixed = mixed ^ (shifted[shift] * multipliers[shift])
-                head_start = (ngram_order - 2) * heads_per_ngram
-                for head in range(head_start, head_start + heads_per_ngram):
-                    row.append(torch.remainder(mixed, sizes[head]) + offsets[head])
-            rows.append(torch.stack(row))
-    output.copy_(torch.stack(rows).to(dtype=output.dtype))
+    qsl = query_start_loc.reshape(-1).to(dtype=torch.int64)
+    num_reqs = max(qsl.numel() - 1, 1)
+    ctx = ngram_context.to(dtype=torch.int64)
+    context_len = ctx.shape[-1]
+    multipliers = layer_multipliers.reshape(-1).to(dtype=torch.int64)
+    sizes = ngram_heads_vocab_sizes.reshape(-1).to(dtype=torch.int64)
+    offsets = ngram_heads_offsets.reshape(-1).to(dtype=torch.int64)
+    positions = torch.arange(num_tokens)
+    req = (torch.searchsorted(qsl, positions, right=True) - 1).clamp(0, num_reqs - 1)
+    request_start = qsl[req]
+    for token_index in range(num_tokens):
+        pos = int(positions[token_index] - request_start[token_index])
+        req_index = int(req[token_index])
+        current = int(tokens[token_index])
+        mixed = current * multipliers[0]
+        crossed = False
+        predecessors = [current]
+        for shift in range(1, context_len + 1):
+            if crossed:
+                token = eos_token_id
+            elif pos >= shift:
+                token = int(tokens[token_index - shift])
+            else:
+                ctx_col = context_len - shift + pos
+                token = int(ctx[req_index, ctx_col])
+            predecessors.append(token)
+            crossed = crossed or token == eos_token_id
+        head = 0
+        for shift, token in enumerate(predecessors):
+            if shift:
+                mixed = mixed ^ (token * multipliers[shift])
+            if shift == 0:
+                continue
+            for _ in range(heads_per_ngram):
+                output[token_index, head] = (
+                    torch.remainder(mixed, sizes[head]) + offsets[head]
+                )
+                head += 1
 
 
 def _ple_ngram_ids(
