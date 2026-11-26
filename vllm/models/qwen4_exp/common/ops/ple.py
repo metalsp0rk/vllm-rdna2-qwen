@@ -112,6 +112,49 @@ def _ple_ngram_ids_kernel(
     )
 
 
+def _ple_ngram_ids_cpu(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_multipliers: torch.Tensor,
+    ngram_heads_vocab_sizes: torch.Tensor,
+    ngram_heads_offsets: torch.Tensor,
+    output: torch.Tensor,
+    eos_token_id: int,
+    heads_per_ngram: int,
+) -> None:
+    """Hash n-gram ids without Triton. The offload worker's tensors are CPU."""
+    tokens = input_ids.reshape(-1).tolist()
+    if not tokens:
+        return
+    starts = query_start_loc.tolist()
+    contexts = ngram_context.tolist()
+    multipliers = layer_multipliers.cpu()
+    sizes = ngram_heads_vocab_sizes.cpu()
+    offsets = ngram_heads_offsets.cpu()
+    context_len = len(contexts[0])
+    rows = []
+    for req, (start, end) in enumerate(zip(starts, starts[1:])):
+        history = contexts[req] + tokens[start:end]
+        for pos in range(context_len, len(history)):
+            shifted = [history[pos]]
+            crossed_eos = False
+            for shift in range(1, context_len + 1):
+                token = eos_token_id if crossed_eos else history[pos - shift]
+                shifted.append(token)
+                crossed_eos |= token == eos_token_id
+            mixed = torch.tensor(shifted[0], dtype=torch.int64) * multipliers[0]
+            row = []
+            for ngram_order in range(2, context_len + 2):
+                shift = ngram_order - 1
+                mixed = mixed ^ (shifted[shift] * multipliers[shift])
+                head_start = (ngram_order - 2) * heads_per_ngram
+                for head in range(head_start, head_start + heads_per_ngram):
+                    row.append(torch.remainder(mixed, sizes[head]) + offsets[head])
+            rows.append(torch.stack(row))
+    output.copy_(torch.stack(rows).to(dtype=output.dtype))
+
+
 def _ple_ngram_ids(
     input_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -123,6 +166,19 @@ def _ple_ngram_ids(
     eos_token_id: int,
     heads_per_ngram: int,
 ) -> None:
+    if input_ids.device.type == "cpu":
+        _ple_ngram_ids_cpu(
+            input_ids,
+            query_start_loc,
+            ngram_context,
+            layer_multipliers,
+            ngram_heads_vocab_sizes,
+            ngram_heads_offsets,
+            output,
+            eos_token_id,
+            heads_per_ngram,
+        )
+        return
     input_ids = input_ids.reshape(-1)
     num_tokens = input_ids.shape[0]
     num_reqs = query_start_loc.numel() - 1
