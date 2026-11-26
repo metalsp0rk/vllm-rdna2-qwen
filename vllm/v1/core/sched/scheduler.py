@@ -85,9 +85,7 @@ logger = init_logger(__name__)
 
 import os as _os
 
-from vllm.v1.core.single_type_kv_cache_manager import prompt_tail_boundary
 _RETENTION_STOPS = _os.getenv("VLLM_RDNA_MAMBA_RETENTION_STOPS", "1") == "1"
-_TAIL_STOP = _os.getenv("VLLM_RDNA_MAMBA_TAIL_STOP", "1") == "1"
 # gfx1030 fork, 2026-10-11 (VLLM_RDNA_OVERLAP_STEP_TOKENS, default 0 = off): while any request is decoding, cap each
 # step at this many tokens in total -- the decodes plus at most (cap - decode tokens) prefill tokens. A full 2048-token
 # prefill chunk makes a step ~1.3 s, so a request decoding next to a long prefill got < 1 token/s until the prefill
@@ -695,27 +693,14 @@ class Scheduler(SchedulerInterface):
                     t += per
             if block_size < mbs:        # equal sizes: upstream's aligned chunk ends already suffice
                 retention_stops = tuple((t + 1) * mbs for t in targets)
-            # gfx1030 fork, 2026-10-09 (turn-boundary state): with --prefix-match-unit finer than the Mamba
-            # block, the Mamba manager registers a partial-tail entry -- the state at the prompt's last
-            # prefix-match boundary, inside its block -- iff a step ends exactly there, so a follow-up turn can
-            # resume within one match unit of the previous prompt's end instead of at its last full block
-            # (<= 783 tokens recomputed per turn at a 784 block, <= 1567 with int8 KV). Upstream adds that stop
-            # only when it lies past `last_cache_position`, computed in the 4-token scheduler unit here, so it
-            # never fired. VLLM_RDNA_MAMBA_TAIL_STOP=0 disables.
-            if (
-                _TAIL_STOP
-                and self.hash_block_size < mbs
-                and self.kv_cache_manager.coordinator.enable_partial_hash_hits
-            ):
-                # the same boundary the Mamba manager registers (backed off past the generation prompt, see
-                # prompt_tail_boundary)
-                tail = prompt_tail_boundary(request.num_prompt_tokens, self.hash_block_size)
-                if tail == request.num_prompt_tokens:
-                    # a prompt ending exactly on a match boundary (backoff 0): the final prompt step ends there but
-                    # registers nothing (its state is mid-handoff to decode); keep the boundary one unit earlier
-                    tail -= self.hash_block_size
-                if tail > 0 and tail % mbs != 0 and start < tail < request.num_prompt_tokens:
-                    retention_stops = retention_stops + (tail,)
+            # The 2026-10-09 "tail stop" hunk (VLLM_RDNA_MAMBA_TAIL_STOP) was retired at the
+            # v0.34.0 rebase: v0.34 registers the mamba/FA partial tail itself within one
+            # prefix-match unit of the prompt end (prefill checkpoints + fine-grained tail
+            # entries), which is exactly where a durable state exists; forcing the older
+            # backed-off boundary (prompt_tail_boundary) as an extra chunk stop now breaks
+            # upstream's checkpoint/junction registration (test_lookahead_mamba_partial_tail_
+            # survives_finish). The generation-prompt divergence is absorbed by the unit
+            # granularity: worst case a follow-up recomputes < match_unit tokens.
         tail_boundary = (
             get_mamba_prefill_checkpoint_position(
                 request.num_prompt_tokens,
