@@ -106,6 +106,9 @@ opentelemetry-sdk==1.44.0
 opentelemetry-semantic-conventions==0.65b0
 opentelemetry-semantic-conventions-ai==0.5.1
 optree==0.13.0
+# orjson: new unconditional vllm dep in the v0.34 line (entrypoints/serve/utils/api_utils),
+# absent from the October venv this file was generated from. requirements/common.txt: >=3.11.6.
+orjson==3.11.6
 outlines_core==0.2.14
 packaging==26.3
 pandas==3.0.5
