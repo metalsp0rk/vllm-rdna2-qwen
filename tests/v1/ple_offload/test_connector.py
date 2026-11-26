@@ -37,14 +37,17 @@ def test_ple_offload_h2h_uses_bound_input_buffers() -> None:
     connector._uses_cuda_inputs = False
     connector._validate_input_sources()
     connector._request_queue = queue.Queue(maxsize=1)
+    connector._launch_seq = 0
+    connector._t_launch = connector._t_wait = connector._t_stage = 0.0
 
     connector._launch(num_reqs=2, num_tokens=4)
 
     # launch only queues MRV1 work; the notifier thread performs the H2H copy.
     assert connector._input_ids_buf.tolist() == [-99, -99, -99, -99]
-    request = connector._request_queue.get_nowait()
-    assert request is not None
-    connector._process_request(request, socket)
+    queued = connector._request_queue.get_nowait()
+    assert queued is not None
+    request, input_ready, _seq = queued
+    connector._process_request(request, input_ready, socket)
 
     assert connector._input_ids_buf.tolist() == [7, -1, 11, -1]
     assert connector._query_start_loc_buf.tolist() == [0, 2, 4]
@@ -69,6 +72,8 @@ def test_ple_offload_request_thread_copies_mrv1_and_stops() -> None:
     connector._input_ready_event = None
     connector._d2h_done_event = None
     connector._request_queue = queue.Queue(maxsize=1)
+    connector._launch_seq = 0
+    connector._t_launch = connector._t_wait = connector._t_stage = 0.0
     connector._request_thread = None
     connector._request_thread_ready = threading.Event()
     connector._zmq_ctx = zmq.Context()
@@ -146,6 +151,8 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
 
     connector._pinned_input_buffers = []
     connector._request_queue = queue.Queue(maxsize=1)
+    connector._launch_seq = 0
+    connector._t_launch = connector._t_wait = connector._t_stage = 0.0
 
     with torch.accelerator.device_index(connector.device.index):
         input_ids = torch.tensor(
@@ -177,9 +184,10 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
 
             # The model thread only records input readiness and queues metadata.
             assert connector._input_ids_buf.tolist() == [-99, -99, -99, -99]
-            request = connector._request_queue.get_nowait()
-            assert request is not None
-            connector._process_request(request, socket)
+            queued = connector._request_queue.get_nowait()
+            assert queued is not None
+            request, input_ready, _seq = queued
+            connector._process_request(request, input_ready, socket)
 
             assert connector._input_ids_buf.tolist() == [7, -1, 11, -1]
             assert connector._query_start_loc_buf.tolist() == [0, 2, 4]
