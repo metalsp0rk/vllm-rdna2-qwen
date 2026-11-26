@@ -178,11 +178,11 @@ class GatedResidual(nn.Module):
                 up.weight,
                 getattr(up, "weight_i8", None),
                 getattr(up, "weight_i8_scale", None),
-                self.lora_rank,
+                self.hc_lowrank,
                 self.hc_count,
             )
             injection = (
-                dai[:, self.lora_rank : self.lora_rank + self.hc_count]
+                dai[:, self.hc_lowrank : self.hc_lowrank + self.hc_count]
                 if self.use_combine
                 else None
             )
@@ -244,11 +244,11 @@ class GatedResidual(nn.Module):
                 up.weight,
                 getattr(up, "weight_i8", None),
                 getattr(up, "weight_i8_scale", None),
-                self.lora_rank,
+                self.hc_lowrank,
                 self.hc_count,
             )
             injection = (
-                dai[:, self.lora_rank : self.lora_rank + self.hc_count]
+                dai[:, self.hc_lowrank : self.hc_lowrank + self.hc_count]
                 if self.use_combine
                 else None
             )
