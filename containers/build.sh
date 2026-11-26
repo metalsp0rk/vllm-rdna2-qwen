@@ -27,6 +27,12 @@ VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE:-0.28.1rc1+rdna2.g${sha}}"
 do_base=0; do_push=0
 for a in "$@"; do case "$a" in --base) do_base=1;; --push) do_push=1;; -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0;; *) echo "unknown arg $a" >&2; exit 2;; esac; done
 export DOCKER_BUILDKIT=1
+# Older/lean Docker installs (e.g. Arch docker without docker-buildx) have no
+# `docker buildx`; since BuildKit is the default frontend of `docker build`
+# (Docker 23+), plain `docker build` is equivalent here: BuildKit frontend,
+# result loaded into the local image store (that is all --load did).
+BUILD_CMD=(docker build)
+if docker buildx version >/dev/null 2>&1; then BUILD_CMD=(docker buildx build --load); fi
 built=()
 log() { printf '\n==> %s\n' "$*"; }
 if [ "$do_base" = 1 ]; then
@@ -38,14 +44,14 @@ if [ "$do_base" = 1 ]; then
     log "base $BASE_IMAGE from the pinned public TheRock tarball (MAX_JOBS=$MAX_JOBS)"
   fi
   ROCK_ARGS=(); [ -n "${THEROCK_URL:-}" ] && ROCK_ARGS+=(--build-arg "THEROCK_URL=$THEROCK_URL"); [ -n "${THEROCK_SHA256:-}" ] && ROCK_ARGS+=(--build-arg "THEROCK_SHA256=$THEROCK_SHA256")
-  docker buildx build --load --progress=plain -f "$here/Dockerfile.base" --target final \
+  "${BUILD_CMD[@]}" --progress=plain -f "$here/Dockerfile.base" --target final \
     "${ROCM_CTX[@]}" "${ROCK_ARGS[@]}" --build-arg "MAX_JOBS=$MAX_JOBS" \
     --label "org.opencontainers.image.revision=$sha" --label "org.opencontainers.image.created=$(date -u +%FT%TZ)" \
     -t "$BASE_IMAGE" "$here"
   built+=("$BASE_IMAGE")
 fi
 log "runtime $REGISTRY_REPO:$VERSION FROM $BASE_IMAGE (vllm version $VLLM_VERSION_OVERRIDE)"
-docker buildx build --load --progress=plain -f "$here/Dockerfile" \
+"${BUILD_CMD[@]}" --progress=plain -f "$here/Dockerfile" \
   --build-arg "BASE_IMAGE=$BASE_IMAGE" --build-arg "MAX_JOBS=$MAX_JOBS" \
   --build-arg "VLLM_VERSION_OVERRIDE=$VLLM_VERSION_OVERRIDE" \
   --build-arg "BUILD_DATE=$(date -u +%FT%TZ)" --build-arg "VCS_REF=$sha" --build-arg "IMAGE_VERSION=$VERSION" \
